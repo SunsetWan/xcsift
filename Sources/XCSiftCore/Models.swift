@@ -154,29 +154,29 @@ public struct BuildResult: Codable, Sendable {
 
         // Add summary notice
         let summaryMessage = buildSummaryMessage()
-        output.append("::notice ::\(summaryMessage)")
+        output.append("::notice ::\(escapeGitHubActionsData(summaryMessage))")
 
         return output.joined(separator: "\n")
     }
 
     private func formatGitHubActionsError(_ error: BuildError) -> String {
         let fileComponents = formatFileComponents(file: error.file, line: error.line, column: error.column)
-        return "::\("error") \(fileComponents)::\(error.message)"
+        return "::error \(fileComponents)::\(escapeGitHubActionsData(error.message))"
     }
 
     private func formatGitHubActionsLinkerError(_ linkerError: LinkerError) -> String {
         if !linkerError.symbol.isEmpty {
             let details =
                 "Undefined symbol '\(linkerError.symbol)' for \(linkerError.architecture), referenced from \(linkerError.referencedFrom)"
-            return "::error ::\(details)"
+            return "::error ::\(escapeGitHubActionsData(details))"
         } else {
-            return "::error ::\(linkerError.message)"
+            return "::error ::\(escapeGitHubActionsData(linkerError.message))"
         }
     }
 
     private func formatGitHubActionsWarning(_ warning: BuildWarning) -> String {
         let fileComponents = formatFileComponents(file: warning.file, line: warning.line, column: warning.column)
-        return "::\("warning") \(fileComponents)::\(warning.message)"
+        return "::warning \(fileComponents)::\(escapeGitHubActionsData(warning.message))"
     }
 
     private func formatGitHubActionsTest(_ test: FailedTest) -> String {
@@ -185,8 +185,8 @@ public struct BuildResult: Codable, Sendable {
         if !fileComponents.isEmpty {
             fileComponents += ","
         }
-        fileComponents += "title=\(test.test)"
-        return "::\("error") \(fileComponents)::\(test.message)"
+        fileComponents += "title=\(escapeGitHubActionsProperty(test.test))"
+        return "::error \(fileComponents)::\(escapeGitHubActionsData(test.message))"
     }
 
     private func formatFileComponents(file: String?, line: Int?, column: Int?) -> String {
@@ -194,15 +194,30 @@ public struct BuildResult: Codable, Sendable {
             return ""
         }
 
+        let escapedFile = escapeGitHubActionsProperty(file)
+
         guard let line = line else {
-            return "file=\(file)"
+            return "file=\(escapedFile)"
         }
 
         if let column = column {
-            return "file=\(file),line=\(line),col=\(column)"
+            return "file=\(escapedFile),line=\(line),col=\(column)"
         }
 
-        return "file=\(file),line=\(line)"
+        return "file=\(escapedFile),line=\(line)"
+    }
+
+    private func escapeGitHubActionsData(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "%", with: "%25")
+            .replacingOccurrences(of: "\r", with: "%0D")
+            .replacingOccurrences(of: "\n", with: "%0A")
+    }
+
+    private func escapeGitHubActionsProperty(_ value: String) -> String {
+        escapeGitHubActionsData(value)
+            .replacingOccurrences(of: ":", with: "%3A")
+            .replacingOccurrences(of: ",", with: "%2C")
     }
 
     private func buildSummaryMessage() -> String {

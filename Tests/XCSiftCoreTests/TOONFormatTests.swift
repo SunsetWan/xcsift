@@ -5,6 +5,29 @@ import XCSiftCore
 /// Tests for TOON format encoding and configuration
 final class TOONFormatTests: XCTestCase {
 
+    func testScriptFailureSemanticsAndRedactionMatchAcrossFormats() throws {
+        let input = """
+            PhaseScriptExecution Run\\ Flutter /tmp/Script.sh (in target 'App' from project 'App')
+            ProcessException: No such file or directory
+              Command: /usr/bin/flutter --token format-secret assemble
+            Command PhaseScriptExecution failed with a nonzero exit code
+            ** BUILD FAILED **
+            """
+        let result = OutputParser().parse(input: input)
+        let json = try XCTUnwrap(String(data: JSONEncoder().encode(result), encoding: .utf8))
+        let toon = try XCTUnwrap(String(data: try TOONEncoder().encode(result), encoding: .utf8))
+        let annotations = result.formatGitHubActions()
+
+        for output in [json, toon, annotations] {
+            XCTAssertTrue(output.contains("ProcessException: No such file or directory"))
+            XCTAssertTrue(output.contains("Command:"))
+            XCTAssertTrue(output.contains("--token"))
+            XCTAssertTrue(output.contains("<redacted>"))
+            XCTAssertFalse(output.contains("format-secret"))
+            XCTAssertFalse(output.contains("#9"))
+        }
+    }
+
     // MARK: - Basic TOON Encoding Tests
 
     func testTOONEncoderBasic() throws {

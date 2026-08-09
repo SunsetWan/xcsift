@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import XCSiftCore
 
 @testable import xcsift
 
@@ -59,7 +60,7 @@ final class StreamingLineReaderTests: XCTestCase {
         XCTAssertTrue(scan.containsNonWhitespace)
     }
 
-    func testOversizedLineIsDiscardedBeforeItsBytesAccumulate() throws {
+    func testOversizedLineRetainsBoundedPrefixBeforeDiscardingItsTail() throws {
         var source = ChunkSource(
             chunks: [
                 Data(repeating: 0x41, count: 100),
@@ -72,10 +73,30 @@ final class StreamingLineReaderTests: XCTestCase {
 
         let scan = try reader.consume(from: &source) { lines.append($0) }
 
-        XCTAssertEqual(lines, ["", "** BUILD SUCCEEDED **"])
-        XCTAssertEqual(scan.oversizedLinesDropped, 1)
+        XCTAssertEqual(lines, [String(repeating: "A", count: 32), "** BUILD SUCCEEDED **"])
+        XCTAssertEqual(scan.oversizedLinesTruncated, 1)
         XCTAssertLessThanOrEqual(scan.maximumBufferedBytes, 32)
         XCTAssertTrue(scan.containsNonWhitespace)
+    }
+
+    func testRepeatedOversizedChunksKeepReaderBufferBounded() throws {
+        let oversizedChunks = Array(repeating: Data(repeating: 0x41, count: 4_096), count: 256)
+        var source = ChunkSource(
+            chunks: oversizedChunks + [Data("\nnext".utf8)],
+            log: EventLog()
+        )
+        var reader = StreamingLineReader(chunkSize: 4_096)
+        var lines: [FramedInputLine] = []
+
+        let scan = try reader.consumeFramed(from: &source) { lines.append($0) }
+
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines[0].text.utf8.count, LineParser.maximumLineBytes)
+        XCTAssertTrue(lines[0].isTruncated)
+        XCTAssertEqual(lines[1].text, "next")
+        XCTAssertFalse(lines[1].isTruncated)
+        XCTAssertEqual(scan.oversizedLinesTruncated, 1)
+        XCTAssertLessThanOrEqual(scan.maximumBufferedBytes, LineParser.maximumLineBytes)
     }
 
     func testPreservesUTF8ScalarsSplitAcrossSingleByteChunks() throws {
@@ -91,6 +112,79 @@ final class StreamingLineReaderTests: XCTestCase {
 
         XCTAssertEqual(lines, ["警告🙂", ""])
         XCTAssertTrue(scan.containsNonWhitespace)
+    }
+
+    func testTruncatedUTF8PrefixIsValidAndFollowingLineRecovers() throws {
+        var source = ChunkSource(
+            chunks: "Command: 🙂🙂🙂\nnext\n".utf8.map { Data([$0]) },
+            log: EventLog()
+        )
+        var reader = StreamingLineReader(chunkSize: 1, maximumLineBytes: 12)
+        var lines: [FramedInputLine] = []
+
+        let scan = try reader.consumeFramed(from: &source) { lines.append($0) }
+
+        XCTAssertEqual(lines.map(\.text), ["Command: ", "next", ""])
+        XCTAssertEqual(lines.map(\.isTruncated), [true, false, false])
+        XCTAssertTrue(lines.allSatisfy { $0.text.utf8.count <= 12 })
+        XCTAssertEqual(scan.oversizedLinesTruncated, 1)
+        XCTAssertLessThanOrEqual(scan.maximumBufferedBytes, 12)
+    }
+
+    func testCombiningMarkTruncationMatchesCoreFraming() throws {
+        let physicalLine = "Command: e" + String(repeating: "\u{301}", count: 32)
+        let expected = FramedInputLine(physicalLine, maximumBytes: 16)
+        var source = ChunkSource(
+            chunks: [Data((physicalLine + "\n").utf8)],
+            log: EventLog()
+        )
+        var reader = StreamingLineReader(chunkSize: 128, maximumLineBytes: 16)
+        var lines: [FramedInputLine] = []
+
+        _ = try reader.consumeFramed(from: &source) { lines.append($0) }
+
+        XCTAssertEqual(lines.first?.text, expected.text)
+        XCTAssertEqual(lines.first?.isTruncated, expected.isTruncated)
+        XCTAssertLessThanOrEqual(lines.first?.text.utf8.count ?? .max, 16)
+    }
+
+    func testOversizedFlutterCommandMatchesCompleteInputParser() throws {
+        let phase =
+            "PhaseScriptExecution Run\\ Flutter /tmp/Script.sh (in target 'App' from project 'App')"
+        let command =
+            "  Command: /usr/bin/flutter --token reader-secret "
+            + String(repeating: "--verbose-segment ", count: 500)
+        let input = [
+            phase,
+            "ProcessException: No such file or directory",
+            command,
+            "Command PhaseScriptExecution failed with a nonzero exit code",
+            "** BUILD FAILED **",
+        ].joined(separator: "\n")
+        var source = ChunkSource(
+            chunks: stride(from: 0, to: input.utf8.count, by: 257).map { offset in
+                let start = input.utf8.index(input.utf8.startIndex, offsetBy: offset)
+                let end = input.utf8.index(start, offsetBy: min(257, input.utf8.count - offset))
+                return Data(input.utf8[start ..< end])
+            },
+            log: EventLog()
+        )
+        var reader = StreamingLineReader(chunkSize: 257)
+        var streamingParser = StreamingOutputParser()
+
+        let scan = try reader.consumeFramed(from: &source) { streamingParser.feed($0) }
+        let streamed = streamingParser.finish()
+        let complete = OutputParser().parse(input: input)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        XCTAssertEqual(try encoder.encode(streamed), try encoder.encode(complete))
+        XCTAssertEqual(scan.oversizedLinesTruncated, 1)
+        XCTAssertTrue(streamed.errors.first?.message.contains("/usr/bin/flutter") == true)
+        XCTAssertTrue(streamed.errors.first?.message.contains("… [truncated]") == true)
+        XCTAssertTrue(streamed.errors.first?.message.contains("<redacted>") == true)
+        XCTAssertFalse(streamed.errors.first?.message.contains("reader-secret") == true)
+        XCTAssertLessThanOrEqual(streamed.errors.first?.message.utf8.count ?? .max, 4_700)
     }
 
     func testPreservesEmptyLinesAndUnterminatedFinalLine() throws {
@@ -129,8 +223,8 @@ final class StreamingLineReaderTests: XCTestCase {
 
         let scan = try reader.consume(from: &source) { lines.append($0) }
 
-        XCTAssertEqual(lines, ["1234", "", "", "é", ""])
-        XCTAssertEqual(scan.oversizedLinesDropped, 1)
+        XCTAssertEqual(lines, ["1234", "", "1234", "é", ""])
+        XCTAssertEqual(scan.oversizedLinesTruncated, 1)
         XCTAssertEqual(scan.maximumBufferedBytes, 4)
         XCTAssertTrue(scan.containsNonWhitespace)
     }

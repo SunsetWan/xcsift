@@ -48,7 +48,7 @@ struct POSIXInputSource: InputChunkSource {
 struct InputScan {
     let containsNonWhitespace: Bool
     let maximumBufferedBytes: Int
-    let oversizedLinesDropped: Int
+    let oversizedLinesTruncated: Int
 }
 
 struct StreamingLineReader {
@@ -60,7 +60,7 @@ struct StreamingLineReader {
     private var containsNonWhitespace = false
     private var isDiscardingOversizedLine = false
     private var maximumBufferedBytes = 0
-    private var oversizedLinesDropped = 0
+    private var oversizedLinesTruncated = 0
 
     init(chunkSize: Int = 64 * 1024, maximumLineBytes: Int = LineParser.maximumLineBytes) {
         precondition(chunkSize > 0, "chunkSize must be greater than zero")
@@ -72,6 +72,15 @@ struct StreamingLineReader {
     mutating func consume<Source: InputChunkSource>(
         from source: inout Source,
         onLine: (String) throws -> Void
+    ) throws -> InputScan {
+        try consumeFramed(from: &source) { framedLine in
+            try onLine(framedLine.text)
+        }
+    }
+
+    mutating func consumeFramed<Source: InputChunkSource>(
+        from source: inout Source,
+        onLine: (FramedInputLine) throws -> Void
     ) throws -> InputScan {
         while let chunk = try source.read(upToCount: chunkSize) {
             guard !chunk.isEmpty else { continue }
@@ -91,13 +100,13 @@ struct StreamingLineReader {
         if isDiscardingOversizedLine || !pendingBytes.isEmpty {
             try emitPendingLine(to: onLine)
         } else if receivedBytes && endedWithNewline {
-            try onLine("")
+            try onLine(FramedInputLine("", maximumBytes: maximumLineBytes))
         }
 
         return InputScan(
             containsNonWhitespace: containsNonWhitespace,
             maximumBufferedBytes: maximumBufferedBytes,
-            oversizedLinesDropped: oversizedLinesDropped
+            oversizedLinesTruncated: oversizedLinesTruncated
         )
     }
 
@@ -121,7 +130,7 @@ struct StreamingLineReader {
 
     private mutating func emitCompleteSegment<Bytes: Collection>(
         _ bytes: Bytes,
-        to onLine: (String) throws -> Void
+        to onLine: (FramedInputLine) throws -> Void
     ) throws where Bytes.Element == UInt8 {
         if isDiscardingOversizedLine || !pendingBytes.isEmpty {
             append(bytes)
@@ -130,19 +139,38 @@ struct StreamingLineReader {
         }
 
         guard bytes.count <= maximumLineBytes else {
-            isDiscardingOversizedLine = true
-            try emitPendingLine(to: onLine)
+            oversizedLinesTruncated += 1
+            containsNonWhitespace = true
+            maximumBufferedBytes = max(maximumBufferedBytes, maximumLineBytes)
+            let prefix = Data(bytes.prefix(maximumLineBytes))
+            try onLine(
+                FramedInputLine(
+                    Self.decodeUTF8Prefix(prefix),
+                    maximumBytes: maximumLineBytes,
+                    isTruncated: true
+                )
+            )
             return
         }
 
         maximumBufferedBytes = max(maximumBufferedBytes, bytes.count)
-        try emitDecodedLine(String(decoding: bytes, as: UTF8.self), to: onLine)
+        try emitDecodedLine(
+            FramedInputLine(
+                String(decoding: bytes, as: UTF8.self),
+                maximumBytes: maximumLineBytes
+            ),
+            to: onLine
+        )
     }
 
     private mutating func append<Bytes: Collection>(_ bytes: Bytes) where Bytes.Element == UInt8 {
         guard !bytes.isEmpty, !isDiscardingOversizedLine else { return }
-        guard pendingBytes.count + bytes.count <= maximumLineBytes else {
-            pendingBytes.removeAll(keepingCapacity: true)
+        let remainingCapacity = maximumLineBytes - pendingBytes.count
+        guard bytes.count <= remainingCapacity else {
+            if remainingCapacity > 0 {
+                pendingBytes.append(contentsOf: bytes.prefix(remainingCapacity))
+                maximumBufferedBytes = max(maximumBufferedBytes, pendingBytes.count)
+            }
             isDiscardingOversizedLine = true
             return
         }
@@ -150,33 +178,57 @@ struct StreamingLineReader {
         maximumBufferedBytes = max(maximumBufferedBytes, pendingBytes.count)
     }
 
-    private mutating func emitPendingLine(to onLine: (String) throws -> Void) throws {
+    private mutating func emitPendingLine(
+        to onLine: (FramedInputLine) throws -> Void
+    ) throws {
         if isDiscardingOversizedLine {
-            oversizedLinesDropped += 1
+            oversizedLinesTruncated += 1
             isDiscardingOversizedLine = false
+            let line = FramedInputLine(
+                Self.decodeUTF8Prefix(pendingBytes),
+                maximumBytes: maximumLineBytes,
+                isTruncated: true
+            )
             pendingBytes.removeAll(keepingCapacity: true)
             // The bytes are intentionally unavailable for a full Unicode whitespace scan. Treat
             // any oversized line as content so a real build invocation is never rejected as empty.
             containsNonWhitespace = true
-            try onLine("")
+            try onLine(line)
             return
         }
 
-        let line = String(decoding: pendingBytes, as: UTF8.self)
+        let line = FramedInputLine(
+            String(decoding: pendingBytes, as: UTF8.self),
+            maximumBytes: maximumLineBytes
+        )
         pendingBytes.removeAll(keepingCapacity: true)
         try emitDecodedLine(line, to: onLine)
     }
 
     private mutating func emitDecodedLine(
-        _ line: String,
-        to onLine: (String) throws -> Void
+        _ line: FramedInputLine,
+        to onLine: (FramedInputLine) throws -> Void
     ) throws {
         if !containsNonWhitespace {
             let whitespace = CharacterSet.whitespacesAndNewlines
-            containsNonWhitespace = line.unicodeScalars.contains {
+            containsNonWhitespace = line.text.unicodeScalars.contains {
                 !whitespace.contains($0)
             }
         }
         try onLine(line)
+    }
+
+    private static func decodeUTF8Prefix(_ bytes: Data) -> String {
+        if let decoded = String(data: bytes, encoding: .utf8) { return decoded }
+
+        var prefix = bytes
+        for _ in 0 ..< 3 where !prefix.isEmpty {
+            prefix.removeLast()
+            if let decoded = String(data: prefix, encoding: .utf8) { return decoded }
+        }
+
+        // Preserve the existing replacement-character behavior for genuinely invalid input;
+        // valid UTF-8 split at the framing boundary always succeeds in the loop above.
+        return String(decoding: bytes, as: UTF8.self)
     }
 }

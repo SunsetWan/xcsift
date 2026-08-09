@@ -281,7 +281,7 @@ struct XCSift: ParsableCommand {
         let inputScan: InputScan
 
         do {
-            inputScan = try lineReader.consume(from: &inputSource) { line in
+            inputScan = try lineReader.consumeFramed(from: &inputSource) { line in
                 parser.feed(line)
             }
         } catch {

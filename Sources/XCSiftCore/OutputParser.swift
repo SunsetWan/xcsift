@@ -155,9 +155,13 @@ public struct StreamingOutputParser {
     ///
     /// Feeding after ``finish(coverage:)`` is a programmer error.
     public mutating func feed(_ line: String) {
+        feed(FramedInputLine(line))
+    }
+
+    package mutating func feed(_ line: FramedInputLine) {
         precondition(finishedResult == nil, "Cannot feed a finished StreamingOutputParser")
-        if shouldDiscoverTestedTarget, testedTarget == nil {
-            testedTarget = Self.extractTestedTarget(fromLine: line)
+        if shouldDiscoverTestedTarget, testedTarget == nil, !line.isTruncated {
+            testedTarget = Self.extractTestedTarget(fromLine: line.text)
         }
         if case .consumed(let event) = lineParser.feed(line) {
             handleEvent(event, printBuildInfo: shouldPrintBuildInfo)
@@ -580,8 +584,10 @@ public class OutputParser {
     /// A `.xctest` suite name such as `MyAppTests.xctest` resolves to `MyApp`.
     public func extractTestedTarget(from input: String) -> String? {
         for line in input.split(separator: "\n") {
+            let framedLine = FramedInputLine(String(line))
+            guard !framedLine.isTruncated else { continue }
             if let testedTarget = StreamingOutputParser.extractTestedTarget(
-                fromLine: String(line)
+                fromLine: framedLine.text
             ) {
                 return testedTarget
             }

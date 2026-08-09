@@ -272,10 +272,12 @@ final class LineParserTests: XCTestCase {
     // MARK: - Test run failed
 
     func testTestRunFailed() {
-        var parser = LineParser()
-        let result = parser.feed("** TEST FAILED **")
-        guard case .consumed(let event) = result, case .testRunFailed = event else {
-            return XCTFail("Expected .consumed(.testRunFailed), got \(result)")
+        for marker in ["** TEST FAILED **", "** TEST EXECUTE FAILED **"] {
+            var parser = LineParser()
+            let result = parser.feed(marker)
+            guard case .consumed(let event) = result, case .testRunFailed = event else {
+                return XCTFail("Expected .consumed(.testRunFailed) for \(marker), got \(result)")
+            }
         }
     }
 
@@ -291,7 +293,10 @@ final class LineParserTests: XCTestCase {
     }
 
     func testSawFailureMarker() {
-        for marker in ["** BUILD FAILED **", "** TEST FAILED **", "Build failed after 1.2s"] {
+        for marker in [
+            "** BUILD FAILED **", "** TEST FAILED **", "** TEST EXECUTE FAILED **",
+            "Build failed after 1.2s",
+        ] {
             var parser = LineParser()
             _ = parser.feed(marker)
             XCTAssertTrue(parser.sawFailureMarker, "Expected failure marker for \(marker)")

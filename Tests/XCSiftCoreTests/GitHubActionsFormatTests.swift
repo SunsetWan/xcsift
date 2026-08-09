@@ -85,6 +85,57 @@ final class GitHubActionsFormatTests: XCTestCase {
         XCTAssertTrue(output.contains("1 warning"))
     }
 
+    func testGitHubActionsEscapesWorkflowCommandDataAndProperties() {
+        let summary = BuildSummary(
+            errors: 2,
+            warnings: 0,
+            failedTests: 1,
+            passedTests: nil,
+            buildTime: nil,
+            coveragePercent: nil
+        )
+        let result = BuildResult(
+            status: "failed",
+            summary: summary,
+            errors: [
+                BuildError(
+                    file: "Sources/a:b,c.swift",
+                    line: 7,
+                    message: "bad %\r\n::warning::injected",
+                    column: 3
+                )
+            ],
+            warnings: [],
+            failedTests: [
+                FailedTest(
+                    test: "test,name: cannot inject\n::error::nested",
+                    message: "failed %\nnext",
+                    file: "Tests/a:b,c.swift",
+                    line: 9
+                )
+            ],
+            coverage: nil,
+            printWarnings: false
+        )
+
+        let output = result.formatGitHubActions()
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+
+        XCTAssertEqual(lines.count, 3, "diagnostic data must not create extra workflow commands")
+        XCTAssertTrue(
+            output.contains(
+                "::error file=Sources/a%3Ab%2Cc.swift,line=7,col=3::bad %25%0D%0A::warning::injected"
+            )
+        )
+        XCTAssertTrue(
+            output.contains(
+                "file=Tests/a%3Ab%2Cc.swift,line=9,title=test%2Cname%3A cannot inject%0A%3A%3Aerror%3A%3Anested::failed %25%0Anext"
+            )
+        )
+        XCTAssertFalse(output.contains("\n::warning::injected"))
+        XCTAssertFalse(output.contains("\n::error::nested"))
+    }
+
     // MARK: - CI Auto-Append Tests
 
     /// Verifies that formatGitHubActions() produces valid annotations

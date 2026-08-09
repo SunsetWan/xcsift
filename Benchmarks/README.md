@@ -33,6 +33,7 @@ XCSIFT_BENCHMARK_PROFILE=video-go-shaped Benchmarks/large-log.sh 10 100 500
 | `phase` | Phase-heavy parser stress case |
 | `fast-reject` | ASCII build-command noise with no reportable event |
 | `fast-reject-unicode` | The same rejection path with Unicode input |
+| `script-context-fast-reject` | Non-diagnostic output while a script phase context is active |
 | `warning-duplicate` | Repeated compiler warning and deduplication path |
 | `warning-unique` | Distinct warning identities and retained-state growth |
 | `fixture-mixed` | Repeated sections of the checked-in real build fixture |

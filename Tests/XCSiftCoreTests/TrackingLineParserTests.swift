@@ -121,6 +121,65 @@ final class TrackingLineParserTests: XCTestCase {
         XCTAssertEqual(r3Range, 3 ... 3)
     }
 
+    func testSemanticScriptFailureAttributedToGenericTerminator() {
+        var parser = TrackingLineParser()
+        _ = parser.feed(
+            "PhaseScriptExecution Run\\ Flutter /tmp/Script.sh (in target 'App' from project 'App')"
+        )
+        _ = parser.feed("ProcessException: No such file or directory")
+        _ = parser.feed("  Command: /usr/bin/flutter assemble")
+
+        let (lineRange, result) = parser.feed(
+            "Command PhaseScriptExecution failed with a nonzero exit code"
+        )
+
+        guard case .consumed(let event) = result, case .error(let error) = event else {
+            return XCTFail("Expected semantic script error, got \(result)")
+        }
+        XCTAssertEqual(lineRange, 4 ... 4)
+        XCTAssertTrue(error.message.contains("ProcessException: No such file or directory"))
+    }
+
+    func testSemanticScriptFailureAtEOFAttributedToLastEvidenceLine() {
+        var parser = TrackingLineParser()
+        _ = parser.feed(
+            "PhaseScriptExecution Run\\ Flutter /tmp/Script.sh (in target 'App' from project 'App')"
+        )
+        _ = parser.feed("ProcessException: No such file or directory")
+        _ = parser.feed("  Command: /usr/bin/flutter assemble")
+        _ = parser.feed("ordinary tail output that is not retained")
+
+        let events = parser.flush()
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.lineRange, 3 ... 3)
+        guard case .error(let error) = events.first?.1 else {
+            return XCTFail("Expected semantic script error")
+        }
+        XCTAssertTrue(error.message.contains("ProcessException: No such file or directory"))
+    }
+
+    func testSemanticScriptFailureAtEOFAttributesEvidenceFromReplayedBufferedLine() {
+        var parser = TrackingLineParser()
+        _ = parser.feed(
+            "PhaseScriptExecution Run\\ Tool /tmp/Script.sh (in target 'App' from project 'App')"
+        )
+        _ = parser.feed("Unhandled exception:")
+        _ = parser.feed(
+            "✘ Test \"otherTest()\" recorded an issue at Other.swift:10:1: No such file or directory"
+        )
+        _ = parser.feed("ordinary ignored tail")
+
+        let events = parser.flush()
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.lineRange, 3 ... 3)
+        guard case .error(let error) = events.first?.1 else {
+            return XCTFail("Expected semantic script error")
+        }
+        XCTAssertTrue(error.message.contains("No such file or directory"))
+    }
+
     // MARK: - Multiple consecutive consumed events
 
     func testConsecutiveConsumedEventsGetSequentialLineNumbers() {

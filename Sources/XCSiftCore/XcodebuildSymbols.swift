@@ -55,10 +55,41 @@ enum XcodebuildSymbols {
     static let testFailed = "TEST FAILED"
     static let testSucceeded = "** TEST SUCCEEDED **"
     static let testExecuteSucceeded = "** TEST EXECUTE SUCCEEDED **"
+    static let testExecuteFailed = "** TEST EXECUTE FAILED **"
     static let buildComplete = "Build complete!"
     static let buildSucceededInPrefix = "Build succeeded in "
     static let buildFailedAfterPrefix = "Build failed after "
     static let secondsKeyword = " seconds"
+
+    // Script phase failures
+    static let phaseScriptExecutionPrefix = "PhaseScriptExecution "
+    static let phaseScriptExecutionFailed = "Command PhaseScriptExecution failed with a nonzero exit"
+    static let processExceptionPrefix = "ProcessException:"
+    static let fileSystemExceptionPrefix = "FileSystemException:"
+    static let loadErrorPrefix = "LoadError:"
+    static let loadErrorMarker = "(LoadError)"
+    static let moduleNotFound = "MODULE_NOT_FOUND"
+    static let commandNotFound = "command not found"
+    static let noSuchFileOrDirectory = "No such file or directory"
+    static let operationNotPermitted = "Operation not permitted"
+    static let dartFileMarker = ".dart:"
+    static let dartErrorMarker = ": Error:"
+    static let toolErrorPrefix = "Error:"
+    static let toolFatalPrefix = "fatal:"
+    static let namedExceptionSuffix = "Exception:"
+    static let scriptTargetPrefix = "Target "
+    static let failedInfix = " failed"
+    static let unhandledException = "Unhandled exception:"
+    static let tracebackPrefix = "Traceback (most recent call last)"
+    static let commandPrefix = "Command:"
+
+    // Build phase prefixes
+    static let compileSwiftSourcesPrefix = "CompileSwiftSources "
+    static let compileCPrefix = "CompileC "
+    static let linkPrefix = "Ld "
+    static let copySwiftLibsPrefix = "CopySwiftLibs "
+    static let linkAssetCatalogPrefix = "LinkAssetCatalog "
+    static let processInfoPlistPrefix = "ProcessInfoPlistFile "
 
     // File extensions
     static let swiftFilePattern = ".swift:"
@@ -78,6 +109,8 @@ enum XcodebuildSymbols {
     static let registerWithLaunchServices = "RegisterWithLaunchServices"
     static let validate = "Validate"
     static let inTarget = "(in target '"
+    static let swiftDriverPrefix = "SwiftDriver"
+    static let compilationKeyword = "Compilation"
 
     // Dependency graph
     static let targetPrefix = "Target '"

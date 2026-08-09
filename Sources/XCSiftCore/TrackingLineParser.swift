@@ -37,6 +37,11 @@ public struct TrackingLineParser: Sendable {
     /// extended to the current line instead of pushing a new entry.
     private var pendingLineRanges: [ClosedRange<Int>] = []
 
+    /// The last line whose text is retained by a semantic script-failure context that may emit
+    /// an error only at EOF. This state is intentionally separate from the FIFO because the
+    /// context can overlap with unrelated buffered events.
+    private var pendingScriptFailureEvidenceRange: ClosedRange<Int>?
+
     // MARK: - Init
 
     /// Creates a new `TrackingLineParser`.
@@ -81,6 +86,17 @@ public struct TrackingLineParser: Sendable {
         let pendingAfter = inner.pendingEventCount
         let didMerge = inner.didMergeCurrentLine
         let droppedDeadBufferedLine = inner.droppedDeadBufferedLine
+        if let origin = inner.capturedScriptFailureEvidenceOrigin {
+            switch origin {
+            case .currentLine:
+                pendingScriptFailureEvidenceRange = currentLine ... currentLine
+            case .bufferedRecordedIssue:
+                pendingScriptFailureEvidenceRange = pendingLineRanges.last
+            }
+        }
+        if !inner.hasPendingSemanticScriptFailure {
+            pendingScriptFailureEvidenceRange = nil
+        }
 
         switch result {
         case .ignored:
@@ -148,15 +164,28 @@ public struct TrackingLineParser: Sendable {
     ///   caused them directly).
     public mutating func flush() -> [(lineRange: ClosedRange<Int>, ParseEvent)] {
         let events = inner.flush()
+        if inner.capturedScriptFailureEvidenceOrigin == .bufferedRecordedIssue {
+            pendingScriptFailureEvidenceRange = pendingLineRanges.last
+        }
+        let scriptFailureIndex = inner.flushedScriptFailureEventIndex
         var out: [(lineRange: ClosedRange<Int>, ParseEvent)] = []
         out.reserveCapacity(events.count)
-        for event in events {
-            let lineRange = pendingLineRanges.isEmpty ? lineCounter ... lineCounter : pendingLineRanges.removeFirst()
+        for (index, event) in events.enumerated() {
+            let lineRange: ClosedRange<Int>
+            if index == scriptFailureIndex, let evidenceRange = pendingScriptFailureEvidenceRange {
+                lineRange = evidenceRange
+                pendingScriptFailureEvidenceRange = nil
+            } else {
+                lineRange =
+                    pendingLineRanges.isEmpty
+                    ? lineCounter ... lineCounter : pendingLineRanges.removeFirst()
+            }
             out.append((lineRange, event))
         }
         // Clear any orphaned entries that did not produce an event (e.g. unemitted state
         // left over after a run that ended without all buffers draining normally).
         pendingLineRanges.removeAll()
+        pendingScriptFailureEvidenceRange = nil
         return out
     }
 }

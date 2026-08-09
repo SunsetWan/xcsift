@@ -44,6 +44,21 @@ generate_input() {
       yes "    cd /Users/runner/work/VideoGo/构建路径 && /usr/bin/touch /private/tmp/DerivedData/VideoGo/Build/Intermediates.noindex/stamp" \
         | head -c "$requested_bytes" >"$generated_path"
       ;;
+    script-context-fast-reject)
+      awk -v target="$requested_bytes" '
+        BEGIN {
+          phase = "PhaseScriptExecution Run\\ Verbose\\ Tool /tmp/Script.sh " \
+            "(in target \047VideoGo\047 from project \047VideoGo\047)"
+          line = "ordinary script output without a diagnostic marker"
+          print phase
+          bytes = length(phase) + 1
+          while (bytes < target) {
+            print line
+            bytes += length(line) + 1
+          }
+        }
+      ' >"$generated_path"
+      ;;
     warning-duplicate)
       yes "/tmp/VideoGo/Sources/Foo.swift:42:7: warning: immutable value 'value' was never used" \
         | head -c "$requested_bytes" >"$generated_path"

@@ -100,6 +100,29 @@ public struct LineParser: Sendable {
     private var pendingRecordedIssueLine: String?
     private var lookBackBuffer: [String] = []
 
+    // MARK: - Script failure context
+    private enum ScriptFailurePriority: Int, Sendable {
+        case exceptionMarker = 10
+        case toolWrapper = 20
+        case specificFailure = 30
+        case sourceDiagnostic = 40
+    }
+
+    private struct ScriptFailureContext: Sendable {
+        static let maximumPhaseBytes = 512
+        static let maximumPrimaryMessageBytes = 2_048
+        static let maximumCommandBytes = 2_048
+
+        var phase: String?
+        var primaryMessage: String?
+        var primaryPriority: ScriptFailurePriority?
+        var command: String?
+        var isExplicitPhase = false
+        var hasEmittedActionableError = false
+    }
+
+    private var scriptFailureContext: ScriptFailureContext?
+
     // MARK: - xcbeautify
     private let shouldParseXcbeautify: Bool
     private let shouldParseBuildInfo: Bool
@@ -116,7 +139,8 @@ public struct LineParser: Sendable {
     public private(set) var sawSuccessMarker: Bool = false
 
     /// `true` if a terminal failure marker was seen
-    /// (`** BUILD FAILED **`, `** TEST FAILED **`, `Build failed after …`).
+    /// (`** BUILD FAILED **`, `** TEST FAILED **`, `** TEST EXECUTE FAILED **`,
+    /// `Build failed after …`).
     public private(set) var sawFailureMarker: Bool = false
 
     // MARK: - Event queue (events waiting to be delivered one per feed() call)
@@ -153,6 +177,26 @@ public struct LineParser: Sendable {
     /// in the pending queue would misattribute a later, unrelated event to the dead line.
     private(set) var droppedDeadBufferedLine: Bool = false
 
+    enum ScriptFailureEvidenceOrigin: Sendable {
+        case currentLine
+        case bufferedRecordedIssue
+    }
+
+    /// Source of the last line processed by the current call that changed the semantic
+    /// script-failure summary. TrackingLineParser uses it for EOF-only synthetic errors.
+    private(set) var capturedScriptFailureEvidenceOrigin: ScriptFailureEvidenceOrigin?
+    private var processingScriptFailureEvidenceOrigin: ScriptFailureEvidenceOrigin = .currentLine
+
+    /// Index of the semantic script-failure event in the array returned by the latest `flush()`.
+    private(set) var flushedScriptFailureEventIndex: Int?
+
+    var hasPendingSemanticScriptFailure: Bool {
+        guard let context = scriptFailureContext else { return false }
+        return context.isExplicitPhase
+            && !context.hasEmittedActionableError
+            && context.primaryMessage != nil
+    }
+
     /// Creates a new `LineParser`.
     ///
     /// - Parameter xcbeautify: Pass `true` when the input was pre-processed by xcbeautify or Tuist.
@@ -184,8 +228,14 @@ public struct LineParser: Sendable {
     /// - Returns: `.consumed(event)` when a ``ParseEvent`` was produced, `.buffering` when
     ///   the line was held for look-ahead, or `.ignored` when no pattern matched.
     public mutating func feed(_ line: String) -> LineResult {
+        feed(FramedInputLine(line))
+    }
+
+    package mutating func feed(_ line: FramedInputLine) -> LineResult {
         didMergeCurrentLine = false
         droppedDeadBufferedLine = false
+        capturedScriptFailureEvidenceOrigin = nil
+        processingScriptFailureEvidenceOrigin = .currentLine
         if !eventQueue.isEmpty {
             // Drain one queued event; schedule current line for next call.
             let queued = eventQueue.removeFirst()
@@ -197,23 +247,37 @@ public struct LineParser: Sendable {
     }
 
     // Called when a queued event is being returned; current line must still be processed.
-    private mutating func enqueueFromLine(_ line: String) {
-        updateLookBackBuffer(line)
-        let candidates = Self.relevantCandidates(in: line)
-        if candidates.contains(.recordedIssue), line.contains(XcodebuildSymbols.recordedIssue) {
-            pendingRecordedIssueLine = line
-        } else if let event = processLine(line, candidates: candidates) {
+    private mutating func enqueueFromLine(_ line: FramedInputLine) {
+        if !line.isTruncated { updateLookBackBuffer(line.text) }
+        let classification =
+            scriptFailureContext?.isExplicitPhase == true
+            ? Self.activeScriptClassification(in: line.text)
+            : LineClassification(
+                candidates: Self.relevantCandidates(in: line.text),
+                hasScriptEvidence: false
+            )
+        if !line.isTruncated, classification.candidates.contains(.recordedIssue),
+            line.text.contains(XcodebuildSymbols.recordedIssue)
+        {
+            pendingRecordedIssueLine = line.text
+        } else if let event = processLine(
+            line.text,
+            classification: classification,
+            isTruncated: line.isTruncated
+        ) {
             eventQueue.append(event)
         }
     }
 
     // Path B: holding a buffered recordedIssue line — flush it, possibly amending with comment.
-    private mutating func flushRecordedIssue(currentLine line: String) -> LineResult {
+    private mutating func flushRecordedIssue(currentLine line: FramedInputLine) -> LineResult {
         let pending = pendingRecordedIssueLine!
+        processingScriptFailureEvidenceOrigin = .bufferedRecordedIssue
         let buffered = processLine(pending)
+        processingScriptFailureEvidenceOrigin = .currentLine
         pendingRecordedIssueLine = nil
 
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let trimmed = line.text.trimmingCharacters(in: .whitespaces)
         let isCommentContinuation =
             trimmed.hasPrefix(XcodebuildSymbols.swiftTestingDetailsPrefix)
             || trimmed.hasPrefix(XcodebuildSymbols.swiftTestingDetailsPrefixFallback)
@@ -236,30 +300,47 @@ public struct LineParser: Sendable {
             return buffered.map { .consumed($0) } ?? .ignored
         } else {
             // Current line is unrelated — enqueue its result, emit buffered now.
-            if let overflow = processLine(line) { eventQueue.append(overflow) }
+            if let overflow = processLine(line.text, isTruncated: line.isTruncated) {
+                eventQueue.append(overflow)
+            }
             if buffered == nil { droppedDeadBufferedLine = true }
             return buffered.map { .consumed($0) } ?? .ignored
         }
     }
 
     // Path C: normal processing with look-back enrichment.
-    private mutating func normalFeed(_ line: String) -> LineResult {
-        let candidates = Self.relevantCandidates(in: line)
-        if candidates.contains(.recordedIssue), line.contains(XcodebuildSymbols.recordedIssue) {
-            pendingRecordedIssueLine = line
-            updateLookBackBuffer(line)
+    private mutating func normalFeed(_ line: FramedInputLine) -> LineResult {
+        let classification =
+            scriptFailureContext?.isExplicitPhase == true
+            ? Self.activeScriptClassification(in: line.text)
+            : LineClassification(
+                candidates: Self.relevantCandidates(in: line.text),
+                hasScriptEvidence: false
+            )
+        if !line.isTruncated, classification.candidates.contains(.recordedIssue),
+            line.text.contains(XcodebuildSymbols.recordedIssue)
+        {
+            pendingRecordedIssueLine = line.text
+            updateLookBackBuffer(line.text)
             return .buffering
         }
 
-        var event = processLine(line, candidates: candidates)
+        var event = processLine(
+            line.text,
+            classification: classification,
+            isTruncated: line.isTruncated
+        )
 
         // PhaseScriptExecution look-back: enrich the error message with preceding context.
-        if case .error(let error) = event, error.message == line,
-            line.contains("Command PhaseScriptExecution failed with a nonzero exit")
+        if case .error(let error) = event, error.message == line.text,
+            line.text.contains(XcodebuildSymbols.phaseScriptExecutionFailed)
         {
             var contextLines: [String] = []
             for contextLine in lookBackBuffer {
-                let trimmed = contextLine.trimmingCharacters(in: .whitespaces)
+                let trimmed = ScriptFailureSanitizer.sanitizeAndBound(
+                    contextLine,
+                    maximumBytes: Self.maximumLineBytes
+                ).trimmingCharacters(in: .whitespaces)
                 if trimmed.isEmpty || trimmed.hasPrefix("Warning:")
                     || trimmed.hasPrefix("Run script build phase")
                 {
@@ -271,12 +352,12 @@ public struct LineParser: Sendable {
                 contextLines.append(trimmed)
             }
             if !contextLines.isEmpty {
-                let combined = contextLines.joined(separator: " ") + " " + line
+                let combined = contextLines.joined(separator: " ") + " " + line.text
                 event = .error(BuildError(file: nil, line: nil, message: combined, column: nil))
             }
         }
 
-        updateLookBackBuffer(line)
+        if !line.isTruncated { updateLookBackBuffer(line.text) }
         return event.map { .consumed($0) } ?? .ignored
     }
 
@@ -289,11 +370,36 @@ public struct LineParser: Sendable {
     ///
     /// - Returns: Zero or more ``ParseEvent`` values representing buffered output.
     public mutating func flush() -> [ParseEvent] {
+        capturedScriptFailureEvidenceOrigin = nil
+        flushedScriptFailureEventIndex = nil
         var result: [ParseEvent] = eventQueue
         eventQueue = []
         if let pending = pendingRecordedIssueLine {
+            processingScriptFailureEvidenceOrigin = .bufferedRecordedIssue
             if let event = processLine(pending) { result.append(event) }
+            processingScriptFailureEvidenceOrigin = .currentLine
             pendingRecordedIssueLine = nil
+        }
+        if let context = scriptFailureContext,
+            context.isExplicitPhase,
+            !context.hasEmittedActionableError,
+            context.primaryMessage != nil
+        {
+            flushedScriptFailureEventIndex = result.count
+            result.append(
+                .error(
+                    finalizeScriptFailure(
+                        fallback: BuildError(
+                            file: nil,
+                            line: nil,
+                            message: XcodebuildSymbols.buildFailed,
+                            column: nil
+                        )
+                    )
+                )
+            )
+        } else {
+            scriptFailureContext = nil
         }
         // If a test was in-flight when the run ended without a crash-confirmation line,
         // emit a synthetic testFailed so callers don't need to read internal state.
@@ -344,9 +450,15 @@ public struct LineParser: Sendable {
         static let all = parserCategories.union(.jsonSyntax)
     }
 
+    private struct LineClassification: Sendable {
+        var candidates: LineCandidates
+        let hasScriptEvidence: Bool
+    }
+
     private struct UTF8Marker: Sendable {
         let bytes: [UInt8]
         let candidates: LineCandidates
+        var isScriptEvidence = false
     }
 
     /// Existing relevance markers grouped by their first UTF-8 byte. Scanning the line once avoids
@@ -370,7 +482,10 @@ public struct LineParser: Sendable {
             XcodebuildSymbols.succeededKeyword,
             XcodebuildSymbols.buildFailedKeyword,
             XcodebuildSymbols.testFailed,
+            XcodebuildSymbols.testExecuteFailed,
             XcodebuildSymbols.buildComplete,
+            XCBeautifySymbols.buildSucceeded,
+            XCBeautifySymbols.testSucceeded,
         ] {
             add(marker, candidates: .status)
         }
@@ -403,11 +518,35 @@ public struct LineParser: Sendable {
             XcodebuildSymbols.dependencyOnTarget,
             XcodebuildSymbols.spmCompiling,
             XcodebuildSymbols.spmLinking,
-            "SwiftDriver",
+            XcodebuildSymbols.swiftDriverPrefix,
         ] {
             add(marker, candidates: .buildInfo)
         }
 
+        return buckets
+    }()
+
+    private static let activeScriptMarkerBuckets: [[UTF8Marker]] = {
+        var buckets = markerBuckets
+        for marker in [
+            XcodebuildSymbols.commandPrefix,
+            XcodebuildSymbols.toolErrorPrefix,
+            XcodebuildSymbols.toolFatalPrefix,
+            XcodebuildSymbols.namedExceptionSuffix,
+            XcodebuildSymbols.loadErrorMarker,
+            XcodebuildSymbols.moduleNotFound,
+            XcodebuildSymbols.commandNotFound,
+            XcodebuildSymbols.noSuchFileOrDirectory,
+            XcodebuildSymbols.operationNotPermitted,
+            XcodebuildSymbols.unhandledException,
+            XcodebuildSymbols.tracebackPrefix,
+            XcodebuildSymbols.scriptTargetPrefix,
+        ] {
+            let bytes = Array(marker.utf8)
+            buckets[Int(bytes[0])].append(
+                UTF8Marker(bytes: bytes, candidates: [], isScriptEvidence: true)
+            )
+        }
         return buckets
     }()
 
@@ -436,7 +575,6 @@ public struct LineParser: Sendable {
                 return candidates
             })
         else {
-            // Preserve parser behavior for an unusual non-contiguous UTF-8 view.
             var candidates = LineCandidates.all
             if line.contains(XcodebuildSymbols.recordedIssue) {
                 candidates.insert(.recordedIssue)
@@ -446,12 +584,95 @@ public struct LineParser: Sendable {
         return candidates
     }
 
+    private static func activeScriptClassification(in line: String) -> LineClassification {
+        guard
+            let classification = line.utf8.withContiguousStorageIfAvailable({ bytes in
+                var candidates: LineCandidates = []
+                var hasScriptEvidence = false
+
+                for index in bytes.indices {
+                    let byte = bytes[index]
+                    let bucketIndex = Int(byte)
+                    for marker in activeScriptMarkerBuckets[bucketIndex] {
+                        if marker.bytes.count > bytes.count - index { continue }
+
+                        var matches = true
+                        for offset in marker.bytes.indices
+                        where bytes[index + offset] != marker.bytes[offset] {
+                            matches = false
+                            break
+                        }
+                        if matches {
+                            candidates.formUnion(marker.candidates)
+                            if marker.isScriptEvidence {
+                                hasScriptEvidence = true
+                            }
+                        }
+                    }
+                }
+
+                return LineClassification(
+                    candidates: candidates,
+                    hasScriptEvidence: hasScriptEvidence
+                )
+            })
+        else {
+            // Preserve parser behavior for an unusual non-contiguous UTF-8 view.
+            var candidates = LineCandidates.all
+            if line.contains(XcodebuildSymbols.recordedIssue) {
+                candidates.insert(.recordedIssue)
+            }
+            return LineClassification(
+                candidates: candidates,
+                hasScriptEvidence: true
+            )
+        }
+        return classification
+    }
+
     /// Returns at most one ParseEvent for a line. Uses if/else if so only one branch fires.
     private mutating func processLine(
         _ line: String,
-        candidates preclassifiedCandidates: LineCandidates? = nil
+        classification preclassifiedClassification: LineClassification? = nil,
+        isTruncated: Bool = false
     ) -> ParseEvent? {
-        if line.isEmpty || line.utf8.count > Self.maximumLineBytes { return nil }
+        let classification =
+            preclassifiedClassification
+            ?? (scriptFailureContext?.isExplicitPhase == true
+                ? Self.activeScriptClassification(in: line)
+                : LineClassification(
+                    candidates: Self.relevantCandidates(in: line),
+                    hasScriptEvidence: false
+                ))
+        var candidates = classification.candidates
+        if scriptFailureContext == nil {
+            if line.hasPrefix(XcodebuildSymbols.phaseScriptExecutionPrefix) {
+                observeScriptFailureContext(
+                    in: line,
+                    candidates: candidates,
+                    hasScriptEvidence: classification.hasScriptEvidence,
+                    wasTruncated: isTruncated
+                )
+            }
+        } else {
+            if !isTruncated, candidates.contains(.status) {
+                let boundary = processScriptBuildFailureBoundary(line, candidates: candidates)
+                if boundary.handled { return boundary.event }
+            }
+            let isNewScriptPhase = line.hasPrefix(XcodebuildSymbols.phaseScriptExecutionPrefix)
+            let isBuildPhaseBoundary = isNonScriptPhaseBoundary(line)
+            if isNewScriptPhase || candidates.contains(.status)
+                || classification.hasScriptEvidence || isBuildPhaseBoundary
+            {
+                observeScriptFailureContext(
+                    in: line,
+                    candidates: candidates,
+                    hasScriptEvidence: classification.hasScriptEvidence,
+                    wasTruncated: isTruncated
+                )
+            }
+        }
+        if line.isEmpty || isTruncated { return nil }
 
         // Linker (multi-line state machine)
         if let event = parseLinkerLine(line) { return event }
@@ -491,7 +712,6 @@ public struct LineParser: Sendable {
         }
 
         // Fast-path filter
-        var candidates = preclassifiedCandidates ?? Self.relevantCandidates(in: line)
         if line.hasPrefix(XcodebuildSymbols.registerWithLaunchServices)
             || line.hasPrefix(XcodebuildSymbols.validate)
         {
@@ -559,6 +779,20 @@ public struct LineParser: Sendable {
                     )
                 )
             }
+            if line.contains(XcodebuildSymbols.phaseScriptExecutionFailed) {
+                if scriptFailureContext?.hasEmittedActionableError == true,
+                    scriptFailureContext?.primaryMessage == nil
+                {
+                    scriptFailureContext = nil
+                    return nil
+                }
+                return .error(finalizeScriptFailure(fallback: error))
+            }
+            if scriptFailureContext?.isExplicitPhase == true,
+                scriptFailureContext?.primaryMessage == nil
+            {
+                scriptFailureContext?.hasEmittedActionableError = true
+            }
             return .error(error)
         }
 
@@ -600,6 +834,218 @@ public struct LineParser: Sendable {
         }
 
         return nil
+    }
+
+    // MARK: - Script Failure Context
+
+    private mutating func processScriptBuildFailureBoundary(
+        _ line: String,
+        candidates: LineCandidates
+    ) -> (handled: Bool, event: ParseEvent?) {
+        guard scriptFailureContext != nil, candidates.contains(.status),
+            line.contains(XcodebuildSymbols.buildFailed)
+                || line.hasPrefix(XcodebuildSymbols.buildFailedAfterPrefix)
+        else {
+            return (false, nil)
+        }
+
+        let timingEvent = parseBuildAndTestTime(line)
+        guard let context = scriptFailureContext else { return (true, timingEvent) }
+        guard !context.hasEmittedActionableError || context.primaryMessage != nil else {
+            scriptFailureContext = nil
+            return (true, timingEvent)
+        }
+        guard context.primaryMessage != nil else {
+            scriptFailureContext = nil
+            return (true, timingEvent)
+        }
+
+        let error = finalizeScriptFailure(
+            fallback: BuildError(
+                file: nil,
+                line: nil,
+                message: XcodebuildSymbols.buildFailed,
+                column: nil
+            )
+        )
+        if let timingEvent { eventQueue.append(timingEvent) }
+        return (true, .error(error))
+    }
+
+    private mutating func observeScriptFailureContext(
+        in line: String,
+        candidates: LineCandidates,
+        hasScriptEvidence: Bool,
+        wasTruncated: Bool = false
+    ) {
+        if line.hasPrefix(XcodebuildSymbols.phaseScriptExecutionPrefix) {
+            scriptFailureContext = ScriptFailureContext(
+                phase: extractScriptPhase(from: line, wasTruncated: wasTruncated),
+                isExplicitPhase: true
+            )
+            return
+        }
+
+        guard scriptFailureContext?.isExplicitPhase == true else { return }
+
+        if candidates.contains(.status), isScriptContextDiscardBoundary(line) {
+            scriptFailureContext = nil
+            return
+        }
+
+        if hasScriptEvidence {
+            let trimmed = line.drop(while: { $0.isWhitespace })
+            if trimmed.hasPrefix(XcodebuildSymbols.commandPrefix) {
+                scriptFailureContext?.command = ScriptFailureSanitizer.sanitizeAndBound(
+                    String(trimmed),
+                    maximumBytes: ScriptFailureContext.maximumCommandBytes,
+                    wasTruncated: wasTruncated
+                )
+                capturedScriptFailureEvidenceOrigin = processingScriptFailureEvidenceOrigin
+                return
+            }
+
+            if let candidate = scriptPrimaryCandidate(in: trimmed) {
+                captureScriptPrimaryCandidate(candidate, wasTruncated: wasTruncated)
+                return
+            }
+        }
+
+        if isNonScriptPhaseBoundary(line) {
+            scriptFailureContext = nil
+        }
+    }
+
+    private mutating func captureScriptPrimaryCandidate(
+        _ candidate: (message: String, priority: ScriptFailurePriority),
+        wasTruncated: Bool
+    ) {
+        if candidate.message.contains(XcodebuildSymbols.moduleNotFound),
+            let primary = scriptFailureContext?.primaryMessage,
+            !primary.contains(XcodebuildSymbols.moduleNotFound)
+        {
+            scriptFailureContext?.primaryMessage = ScriptFailureSanitizer.sanitizeAndBound(
+                primary + "; " + candidate.message,
+                maximumBytes: ScriptFailureContext.maximumPrimaryMessageBytes,
+                wasTruncated: wasTruncated
+            )
+            capturedScriptFailureEvidenceOrigin = processingScriptFailureEvidenceOrigin
+        } else if scriptFailureContext?.primaryPriority == nil
+            || candidate.priority.rawValue > (scriptFailureContext?.primaryPriority?.rawValue ?? 0)
+        {
+            scriptFailureContext?.primaryMessage = ScriptFailureSanitizer.sanitizeAndBound(
+                candidate.message,
+                maximumBytes: ScriptFailureContext.maximumPrimaryMessageBytes,
+                wasTruncated: wasTruncated
+            )
+            scriptFailureContext?.primaryPriority = candidate.priority
+            capturedScriptFailureEvidenceOrigin = processingScriptFailureEvidenceOrigin
+        }
+    }
+
+    private func scriptPrimaryCandidate(
+        in line: Substring
+    ) -> (message: String, priority: ScriptFailurePriority)? {
+        guard !line.isEmpty else { return nil }
+
+        if line.contains(XcodebuildSymbols.dartFileMarker),
+            line.contains(XcodebuildSymbols.dartErrorMarker)
+        {
+            return (String(line), .sourceDiagnostic)
+        }
+
+        if line.hasPrefix(XcodebuildSymbols.processExceptionPrefix)
+            || line.hasPrefix(XcodebuildSymbols.fileSystemExceptionPrefix)
+            || line.hasPrefix(XcodebuildSymbols.loadErrorPrefix)
+            || line.contains(XcodebuildSymbols.loadErrorMarker)
+            || line.contains(XcodebuildSymbols.moduleNotFound)
+            || line.contains(XcodebuildSymbols.commandNotFound)
+            || line.contains(XcodebuildSymbols.noSuchFileOrDirectory)
+            || line.contains(XcodebuildSymbols.operationNotPermitted)
+            || isNamedException(line)
+        {
+            return (String(line), .specificFailure)
+        }
+
+        if line.hasPrefix(XcodebuildSymbols.toolErrorPrefix)
+            || line.hasPrefix(XcodebuildSymbols.toolFatalPrefix)
+        {
+            return (String(line), .specificFailure)
+        }
+
+        if line.hasPrefix(XcodebuildSymbols.scriptTargetPrefix),
+            line.contains(XcodebuildSymbols.failedInfix)
+        {
+            return (String(line), .toolWrapper)
+        }
+
+        if line == XcodebuildSymbols.unhandledException
+            || line.hasPrefix(XcodebuildSymbols.tracebackPrefix)
+        {
+            return (String(line), .exceptionMarker)
+        }
+
+        return nil
+    }
+
+    private func isNamedException(_ line: Substring) -> Bool {
+        guard let colon = line.firstIndex(of: ":") else { return false }
+        let type = line[..<colon]
+        guard !type.isEmpty, !type.contains(where: { $0.isWhitespace }) else { return false }
+        return type.hasSuffix("Error") || type.hasSuffix("Exception")
+    }
+
+    private func isScriptContextDiscardBoundary(_ line: String) -> Bool {
+        line.contains(XcodebuildSymbols.buildSucceeded)
+            || line.contains(XcodebuildSymbols.testSucceeded)
+            || line.contains(XcodebuildSymbols.testExecuteSucceeded)
+            || line.contains(XcodebuildSymbols.testExecuteFailed)
+            || line.contains(XcodebuildSymbols.testFailed)
+            || line.hasPrefix(XcodebuildSymbols.buildComplete)
+            || line.hasPrefix(XcodebuildSymbols.buildSucceededInPrefix)
+            || line.contains(XCBeautifySymbols.buildSucceeded)
+            || line.contains(XCBeautifySymbols.testSucceeded)
+    }
+
+    private func isNonScriptPhaseBoundary(_ line: String) -> Bool {
+        guard let firstByte = line.utf8.first else { return false }
+        guard firstByte >= 0x41, firstByte <= 0x5A else { return false }
+        guard !line.hasPrefix(XcodebuildSymbols.phaseScriptExecutionPrefix) else { return false }
+        return line.contains(XcodebuildSymbols.inTarget)
+    }
+
+    private func extractScriptPhase(from line: String, wasTruncated: Bool) -> String? {
+        var body = line.dropFirst(XcodebuildSymbols.phaseScriptExecutionPrefix.count)
+        if let targetRange = body.range(of: " " + XcodebuildSymbols.inTarget) {
+            body = body[..<targetRange.lowerBound]
+        }
+
+        guard let pathSeparator = body.lastIndex(of: " ") else { return nil }
+        let phase = body[..<pathSeparator]
+            .trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "\\ ", with: " ")
+        return phase.isEmpty
+            ? nil
+            : ScriptFailureSanitizer.sanitizeAndBound(
+                phase,
+                maximumBytes: ScriptFailureContext.maximumPhaseBytes,
+                wasTruncated: wasTruncated
+            )
+    }
+
+    private mutating func finalizeScriptFailure(fallback: BuildError) -> BuildError {
+        defer { scriptFailureContext = nil }
+        guard let context = scriptFailureContext else { return fallback }
+        guard context.primaryMessage != nil || context.command != nil else { return fallback }
+
+        var message = context.primaryMessage ?? fallback.message
+        if let phase = context.phase {
+            message = "\(phase): \(message)"
+        }
+        if let command = context.command {
+            message += "; \(command)"
+        }
+        return BuildError(file: nil, line: nil, message: message, column: nil)
     }
 
     // MARK: - Static Regex Patterns
@@ -1093,7 +1539,7 @@ public struct LineParser: Sendable {
             return BuildError(file: nil, line: nil, message: String(line.dropFirst(7)), column: nil)
         }
 
-        if line.contains("Command PhaseScriptExecution failed with a nonzero exit") {
+        if line.contains(XcodebuildSymbols.phaseScriptExecutionFailed) {
             return BuildError(file: nil, line: nil, message: line, column: nil)
         }
 
@@ -1406,7 +1852,9 @@ public struct LineParser: Sendable {
             return bracketedTime(line)
         }
 
-        if line.contains(XcodebuildSymbols.testFailed) {
+        if line.contains(XcodebuildSymbols.testFailed)
+            || line.contains(XcodebuildSymbols.testExecuteFailed)
+        {
             sawTestRunFailed = true
             sawFailureMarker = true
             return .testRunFailed
@@ -1589,13 +2037,13 @@ public struct LineParser: Sendable {
     // MARK: - Build Phase Parsing
 
     private static let phasePatterns: [(prefix: String, phaseName: String)] = [
-        ("CompileSwiftSources ", "CompileSwiftSources"),
-        ("CompileC ", "CompileC"),
-        ("Ld ", "Link"),
-        ("CopySwiftLibs ", "CopySwiftLibs"),
-        ("PhaseScriptExecution ", "PhaseScriptExecution"),
-        ("LinkAssetCatalog ", "LinkAssetCatalog"),
-        ("ProcessInfoPlistFile ", "ProcessInfoPlistFile"),
+        (XcodebuildSymbols.compileSwiftSourcesPrefix, "CompileSwiftSources"),
+        (XcodebuildSymbols.compileCPrefix, "CompileC"),
+        (XcodebuildSymbols.linkPrefix, "Link"),
+        (XcodebuildSymbols.copySwiftLibsPrefix, "CopySwiftLibs"),
+        (XcodebuildSymbols.phaseScriptExecutionPrefix, "PhaseScriptExecution"),
+        (XcodebuildSymbols.linkAssetCatalogPrefix, "LinkAssetCatalog"),
+        (XcodebuildSymbols.processInfoPlistPrefix, "ProcessInfoPlistFile"),
     ]
 
     private func extractTarget(from line: String) -> String? {
@@ -1614,7 +2062,8 @@ public struct LineParser: Sendable {
                 return (phaseName, target)
             }
         }
-        if line.contains("SwiftDriver"), line.contains("Compilation"),
+        if line.contains(XcodebuildSymbols.swiftDriverPrefix),
+            line.contains(XcodebuildSymbols.compilationKeyword),
             let target = extractTarget(from: line)
         {
             return ("SwiftCompilation", target)
